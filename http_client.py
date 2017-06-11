@@ -10,13 +10,24 @@ except ImportError:
 SUPPORT_TIMEOUT = hasattr(usocket.socket, 'settimeout')
 CONTENT_TYPE_JSON = 'application/json'
 
+# Read all http headers from a socket
+def parse_headers(sock):
+    headers = {}
+    line = b""
+    while line != b'\r\n':
+        line = sock.readline()
+        if line.strip():
+            name, value = line.strip().split(b': ')
+            headers[name] = value.strip()
+    return headers
 
 class Response(object):
-    def __init__(self, status_code, raw):
+    def __init__(self, status_code, raw, resp_headers):
         self.status_code = status_code
         self.raw = raw
         self._content = False
         self.encoding = 'utf-8'
+        self.headers = resp_headers
 
     @property
     def content(self):
@@ -39,6 +50,25 @@ class Response(object):
             self.raw.close()
             self.raw = None
 
+    def multipart(self):
+        if b'Content-Type' in self.headers and 'multipart/x-mixed-replace' in self.headers[b'Content-Type']:
+            boundary = str(self.headers[b'Content-Type'],'utf-8').split('boundary=')[1]
+            #print(boundary)
+            block = b""
+            while boundary not in block:
+                block += self.raw.read(1)
+            block += self.raw.read(2)
+            while True:
+                headers = parse_headers(self.raw)
+                block = b""
+                while boundary not in block:
+                    block += self.raw.read(1)
+                block += self.raw.read(2)
+
+                r = Response(self.status_code, None, headers)
+                r._content = block
+                yield r
+
     def json(self):
         return ujson.loads(self.text)
 
@@ -50,7 +80,7 @@ class Response(object):
 
 
 # Adapted from upip
-def request(method, url, json=None, timeout=None, headers=None):
+def request(method, url, json=None, timeout=None, headers=None, follow_redirect=True):
     urlparts = url.split('/', 3)
     proto = urlparts[0]
     host = urlparts[2]
@@ -105,11 +135,19 @@ def request(method, url, json=None, timeout=None, headers=None):
     l = sock.readline()
     protover, status, msg = l.split(None, 2)
 
-    # Skip headers
-    while sock.readline() != b'\r\n':
-        pass
+    # Collect headers
+    headers = parse_headers(sock)
 
-    return Response(int(status), sock)
+    # Handle redirects
+    if int(status) in [301, 301] and b'Location' in headers:
+        if 'http' not in headers[b'Location']:
+            # relative redirect
+            redirect = proto+"://"+host+"/"+str(headers[b'Location'], 'utf-8')
+        else:
+            redirect = str(headers[b'Location'], 'utf-8')
+        return request(method, redirect, json, timeout, headers, follow_redirect)
+
+    return Response(int(status), sock, headers)
 
 
 def get(url, **kwargs):
